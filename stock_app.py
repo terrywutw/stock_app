@@ -8,6 +8,13 @@ import pandas as pd
 import json
 import os
 
+# 自動載入 .env（若存在）
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv 未安裝時略過，改用介面輸入
+
 # ─────────────────────────────────────────────
 # 0. 全域設定
 # ─────────────────────────────────────────────
@@ -238,6 +245,222 @@ for i, name in enumerate(order):
                 unsafe_allow_html=True,
             )
         st.markdown("</div>", unsafe_allow_html=True)
+
+st.divider()
+
+# ─────────────────────────────────────────────
+# 7.5  情勢分析（規則判斷 + Gemini AI）
+# ─────────────────────────────────────────────
+st.subheader("🤖 情勢分析")
+
+# ── 量價分類閾值 ──────────────────────────────
+def classify_chg(pct: float) -> tuple:
+    """漲跌幅分類，回傳 (等級, emoji, 說明)"""
+    abs_p = abs(pct)
+    if pct > 0:
+        if abs_p < 0.5:   return ("微漲", "🟡", "漲幅不明顯")
+        elif abs_p < 2.0: return ("小漲", "🟢", "溫和上漲")
+        else:             return ("大漲", "🚀", "強勢上攻")
+    elif pct < 0:
+        if abs_p < 0.5:   return ("微跌", "🟡", "跌幅不明顯")
+        elif abs_p < 2.0: return ("小跌", "🔴", "溫和下跌")
+        else:             return ("大跌", "💥", "急殺破位")
+    else:
+        return ("平盤", "⬜", "無方向")
+
+def classify_vol(vol_ratio: float) -> tuple:
+    """成交量比（今日/5日均量）分類，回傳 (等級, 說明)"""
+    if vol_ratio < 0.7:   return ("小量", "量縮")
+    elif vol_ratio < 1.3: return ("中量", "量平")
+    else:                 return ("大量", "量增")
+
+# 量價組合對照表：(漲跌等級, 量級) → (訊號, 建議)
+SIGNAL_MAP = {
+    # ── 漲勢 ──
+    ("大漲", "大量"): ("🔥 強勢突破",   "主力積極買入，可考慮追進或持有，注意追高風險"),
+    ("大漲", "中量"): ("✅ 健康上漲",   "漲勢穩健，可持有，回測均線可加碼"),
+    ("大漲", "小量"): ("⚠️ 量縮急漲",   "漲勢恐難持續，可能為軋空，謹慎追高"),
+    ("小漲", "大量"): ("📈 量增緩漲",   "資金流入但分歧，觀察是否能繼續放量突破"),
+    ("小漲", "中量"): ("😊 溫和上漲",   "多方略佔優勢，可持有，等待量能擴大"),
+    ("小漲", "小量"): ("😴 量縮微揚",   "動能不足，持有觀望，不宜追買"),
+    ("微漲", "大量"): ("🤔 量增價滯",   "多空拉鋸，大量無法推升，需留意轉弱風險"),
+    ("微漲", "中量"): ("😐 盤整偏多",   "方向不明，等待突破確認再行動"),
+    ("微漲", "小量"): ("💤 縮量盤整",   "觀望氣氛濃，暫時按兵不動"),
+    # ── 跌勢 ──
+    ("大跌", "大量"): ("🚨 急殺出逃",   "恐慌性拋售，短線避險，等止跌訊號再承接"),
+    ("大跌", "中量"): ("🔻 中量重跌",   "跌勢明確，宜減碼或停損，不宜抄底"),
+    ("大跌", "小量"): ("❓ 量縮急跌",   "可能為洗盤，但破支撐則需停損"),
+    ("小跌", "大量"): ("⚡ 量增下跌",   "賣壓偏重，短線偏空，等買盤回穩"),
+    ("小跌", "中量"): ("📉 溫和下跌",   "多空均衡偏空，持股控制倉位"),
+    ("小跌", "小量"): ("🧊 量縮小跌",   "賣壓不重，可能為回檔整理，留意反彈"),
+    ("微跌", "大量"): ("⚠️ 量增價滯跌", "大量無法守平，需留意後續走弱"),
+    ("微跌", "中量"): ("😑 盤整偏空",   "方向不明偏弱，觀望"),
+    ("微跌", "小量"): ("💤 縮量盤跌",   "氣氛冷清，等待方向"),
+    # ── 平盤 ──
+    ("平盤", "大量"): ("🤷 大量平盤",   "多空激烈拉鋸，方向待確認"),
+    ("平盤", "中量"): ("😶 平盤整理",   "無明顯方向，暫時觀望"),
+    ("平盤", "小量"): ("💤 縮量平盤",   "市場冷清，等待催化劑"),
+}
+
+# ── 規則判斷主體 ────────────────────────────
+rule_cols = st.columns(len(order))
+for i, name in enumerate(order):
+    if name not in data:
+        continue
+    curr      = data[name].iloc[0]
+    prev      = data[name].iloc[1] if len(data[name]) > 1 else curr
+    p         = float(curr["Close"])
+    pct       = float(curr["幅%"])
+    buy_p     = float(curr["買盤%"])
+    label     = STOCKS[name]["label"] if name in STOCKS else "加權指數"
+
+    # 量比（今日 vs 5日均量）
+    vol_today = float(curr.get("Volume", 0))
+    vol_ma5   = float(data[name]["Volume"].iloc[1:6].mean()) if len(data[name]) >= 6 else vol_today
+    vol_ratio = vol_today / vol_ma5 if vol_ma5 > 0 else 1.0
+
+    chg_level, chg_emoji, chg_desc = classify_chg(pct)
+    vol_level, vol_desc            = classify_vol(vol_ratio)
+    signal, advice = SIGNAL_MAP.get((chg_level, vol_level), ("❔ 資料不足", "請人工判斷"))
+
+    # 買盤強弱
+    if buy_p >= 70:   buy_desc, buy_clr = "買盤強勢", "#ff4d4d"
+    elif buy_p >= 50: buy_desc, buy_clr = "買盤略強", "#ff9900"
+    elif buy_p >= 30: buy_desc, buy_clr = "賣盤略強", "#51cf66"
+    else:             buy_desc, buy_clr = "賣盤強勢", "#1a7a3f"
+
+    with rule_cols[i]:
+        st.markdown(f"""
+        <div style='background:#fff;border:1px solid #dce3ee;border-radius:10px;padding:14px;'>
+            <div style='font-weight:700;font-size:0.95rem;color:#1a2540;margin-bottom:8px;'>
+                {chg_emoji} {name} {label}
+            </div>
+            <div style='font-size:1.3rem;font-weight:700;color:{"#ff4d4d" if pct>=0 else "#51cf66"};'>
+                {pct:+.2f}%
+            </div>
+            <div style='font-size:0.82rem;color:#555;margin:4px 0;'>
+                {chg_level} × {vol_level}（量比 {vol_ratio:.1f}x）
+            </div>
+            <div style='font-size:0.88rem;font-weight:600;margin:6px 0;color:#1a2540;'>
+                {signal}
+            </div>
+            <div style='font-size:0.80rem;color:#444;border-top:1px solid #eee;padding-top:6px;margin-top:4px;'>
+                💡 {advice}
+            </div>
+            <div style='margin-top:8px;background:#eee;border-radius:4px;height:8px;'>
+                <div style='width:{buy_p:.0f}%;background:{buy_clr};height:8px;border-radius:4px;'></div>
+            </div>
+            <div style='font-size:0.75rem;color:{buy_clr};margin-top:3px;'>
+                {buy_desc} {buy_p:.1f}%
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+# ── Gemini AI 深度分析 ──────────────────────
+st.markdown("<div style='margin-top:16px'></div>", unsafe_allow_html=True)
+
+# API Key 設定
+_env_key = os.getenv("GEMINI_API_KEY", "")
+if "gemini_key" not in st.session_state:
+    st.session_state.gemini_key = _env_key
+
+if not _env_key:
+    with st.expander("🔑 設定 Gemini API Key（選填，可使用 AI 深度分析）", expanded=False):
+        key_input = st.text_input(
+            "Gemini API Key",
+            value=st.session_state.gemini_key,
+            type="password",
+            placeholder="貼上你的 API Key，或在 .env 設定 GEMINI_API_KEY=...",
+        )
+        if key_input:
+            st.session_state.gemini_key = key_input
+            st.success("✅ API Key 已設定")
+else:
+    st.caption("🔐 Gemini API Key 已從 `.env` 自動載入")
+
+def build_market_summary() -> str:
+    lines = []
+    for name in order:
+        if name not in data:
+            continue
+        df5   = data[name].head(5)
+        curr  = df5.iloc[0]
+        label = STOCKS[name]["label"] if name in STOCKS else "加權指數"
+        p     = float(curr["Close"])
+        chg   = float(curr["幅%"])
+        buy_p = float(curr["買盤%"])
+        sel_p = float(curr["賣盤%"])
+        vol_today = float(curr.get("Volume", 0))
+        vol_ma5   = float(data[name]["Volume"].iloc[1:6].mean()) if len(data[name]) >= 6 else vol_today
+        vol_ratio = vol_today / vol_ma5 if vol_ma5 > 0 else 1.0
+        chg_level, _, _ = classify_chg(chg)
+        vol_level, _    = classify_vol(vol_ratio)
+
+        ma_status = []
+        for mkey, mlab in [("MA5","5日"),("MA20","月線"),("MA60","季線"),("MA120","半年線"),("MA240","年線")]:
+            ma_v = curr.get(mkey)
+            if ma_v is not None and not pd.isna(ma_v):
+                status = "上方" if p > ma_v else "下方"
+                ma_status.append(f"{mlab}{status}({ma_v:.1f})")
+
+        recent = " / ".join(f"{float(r['幅%']):+.2f}%" for _, r in df5.iterrows())
+        lines.append(
+            f"【{name} {label}】\n"
+            f"  收盤：{p:,.2f}　漲跌：{chg:+.2f}%（{chg_level}）\n"
+            f"  成交量比5日均量：{vol_ratio:.1f}倍（{vol_level}）\n"
+            f"  近5日漲跌：{recent}\n"
+            f"  買盤：{buy_p:.1f}%　賣盤：{sel_p:.1f}%\n"
+            f"  均線位置：{', '.join(ma_status) if ma_status else '資料不足'}\n"
+        )
+    return "\n".join(lines)
+
+def call_gemini(summary: str, api_key: str) -> str:
+    import urllib.request as _ur, json as _js
+    prompt = (
+        "你是一位專業台股分析師，擅長技術分析與籌碼分析。\n"
+        "請根據以下資料，針對每個標的綜合分析量價關係、買賣盤力道、均線結構，\n"
+        "並給出明確操作建議（買進／持有／觀望／減碼／賣出）。\n"
+        "最後整體評估大盤與持股組合風險。\n"
+        "語氣專業簡潔，繁體中文，每個標的 3-4 句，整體評估 2-3 句。\n\n"
+        f"{summary}"
+    )
+    url  = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    body = _js.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": 1500, "temperature": 0.4},
+    }).encode()
+    try:
+        req  = _ur.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        resp = _ur.urlopen(req, timeout=30)
+        result = _js.loads(resp.read())
+        return result["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        try:
+            err_body = e.read().decode() if hasattr(e, "read") else str(e)
+            err_json = _js.loads(err_body)
+            return f"⚠️ Gemini 錯誤：{err_json.get('error', {}).get('message', err_body)}"
+        except Exception:
+            return f"⚠️ 呼叫失敗：{e}"
+
+ai_c1, ai_c2 = st.columns([1, 4])
+with ai_c1:
+    run_ai = st.button("🔍 Gemini 深度分析", type="primary", disabled=not st.session_state.gemini_key)
+with ai_c2:
+    if st.session_state.gemini_key:
+        st.caption("點擊按鈕，Gemini 將進行更深入的綜合判斷與建議")
+    else:
+        st.caption("設定 Gemini API Key 後可啟用 AI 深度分析（上方規則判斷無需 Key）")
+
+if run_ai:
+    summary = build_market_summary()
+    with st.spinner("🤖 Gemini 正在深度分析..."):
+        analysis = call_gemini(summary, st.session_state.gemini_key)
+    st.markdown(
+        f"<div style='background:#f8faff;border:1px solid #d0dff5;border-radius:10px;"
+        f"padding:18px 22px;font-size:0.92rem;line-height:1.8;color:#1a2540;margin-top:12px;'>"
+        f"{analysis.replace(chr(10), '<br>')}</div>",
+        unsafe_allow_html=True,
+    )
 
 st.divider()
 
